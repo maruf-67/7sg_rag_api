@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>7SG Vector Store Management</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        h1 {
+            color: #333;
+        }
+        .status {
+            margin-bottom: 20px;
+        }
+        .status p {
+            margin: 5px 0;
+        }
+        .success {
+            color: green;
+        }
+        .error {
+            color: red;
+        }
+        .form-container {
+            border: 1px solid #ccc;
+            padding: 20px;
+            border-radius: 5px;
+        }
+        .form-container label {
+            display: block;
+            margin-bottom: 10px;
+        }
+        .form-container input[type="file"] {
+            margin-bottom: 10px;
+        }
+        .form-container input[type="submit"] {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .form-container input[type="submit"]:hover {
+            background-color: #0056b3;
+        }
+        .message {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .message.success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <h1>🧠 7SG Vector Store Management</h1>
+    <div class="status">
+        <p><strong>Database:</strong> {{ 'Connected' if db_status else 'Not connected' }} ({{ db_message }})</p>
+        <p><strong>Vector Store:</strong> {{ vectorstore_status }}</p>
+        <p><strong>Processed Files:</strong> {{ processed_files|join(', ') or 'None' }}</p>
+    </div>
+    {% if message %}
+        <div class="message {{ message_type }}">{{ message }}</div>
+    {% endif %}
+    <div class="form-container">
+        <form method="POST" enctype="multipart/form-data">
+            <label for="pdfs">Upload 7SG PDFs:</label>
+            <input type="file" name="pdfs" id="pdfs" accept=".pdf" multiple>
+            <label>
+                <input type="checkbox" name="clear_collection">
+                Clear existing data in '{{ COLLECTION_NAME }}' before upload
+            </label>
+            <input type="submit" value="Upload and Process">
+        </form>
+    </div>
+</body>
+</html>
