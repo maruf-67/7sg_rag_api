@@ -63,6 +63,13 @@
             background-color: #f8d7da;
             color: #721c24;
         }
+        .file-list a {
+            text-decoration: none;
+            color: #007bff;
+        }
+        .file-list a:hover {
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
@@ -70,7 +77,17 @@
     <div class="status">
         <p><strong>Database:</strong> {{ 'Connected' if db_status else 'Not connected' }} ({{ db_message }})</p>
         <p><strong>Vector Store:</strong> {{ vectorstore_status }}</p>
-        <p><strong>Processed Files:</strong> {{ processed_files|join(', ') or 'None' }}</p>
+        <p><strong>Processed Files:</strong>
+            {% if processed_files %}
+                <ul class="file-list">
+                    {% for file in processed_files %}
+                        <li><a href="{{ base_url }}/download/{{ file }}" download>{{ file }}</a></li>
+                    {% endfor %}
+                </ul>
+            {% else %}
+                None
+            {% endif %}
+        </p>
     </div>
     {% if message %}
         <div class="message {{ message_type }}">{{ message }}</div>

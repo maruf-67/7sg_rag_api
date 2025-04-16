@@ -1,8 +1,9 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_from_directory, redirect, url_for
 import os
 import shutil
 import uuid
 import psycopg2
+import logging
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PDFPlumberLoader
@@ -12,6 +13,10 @@ from langchain_postgres.vectorstores import PGVector
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
+
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -26,6 +31,7 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 UPLOAD_FOLDER = "uploads"
 TEMP_DIR = "temp_pdf_files"
 ALLOWED_EXTENSIONS = {'pdf'}
+BASE_URL = "http://localhost:5000"  # Update for production
 
 # Ensure directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -69,73 +75,114 @@ def init_vectorstore():
                 connection=CONNECTION_STRING,
             )
             state.vectorstore.similarity_search("test query", k=1)
+            logger.debug("Connected to existing vector store.")
             return True, "Connected to existing vector store."
         except Exception as e:
             state.vectorstore = None
+            logger.error(f"Could not connect to vector store: {e}")
             return False, f"Could not connect to vector store: {e}"
     return True, "Vector store already initialized."
+
+def clear_collection_fun():
+    try:
+        embeddings = get_embeddings_model()
+        temp_vs = PGVector(
+            embeddings=embeddings,
+            collection_name=COLLECTION_NAME,
+            connection=CONNECTION_STRING,
+        )
+        temp_vs.delete_collection()
+        # Clear uploads/ directory
+        shutil.rmtree(UPLOAD_FOLDER)
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        state.processed_files = []
+        logger.debug("Cleared vector store collection and uploads directory.")
+        return True, "Collection and uploads cleared."
+    except Exception as e:
+        logger.error(f"Error clearing collection: {e}")
+        return False, f"Error clearing collection: {e}"
 
 def process_pdfs(pdf_files, clear_collection=False):
     embeddings = get_embeddings_model()
     all_docs = []
 
+    # Clear collection before processing if requested
+    if clear_collection:
+        success, clear_message = clear_collection_fun()
+        if not success:
+            return False, clear_message
+
     for pdf_file in pdf_files:
         try:
+            filename = secure_filename(pdf_file.filename)
             temp_filename = f"{uuid.uuid4()}.pdf"
             temp_filepath = os.path.join(TEMP_DIR, temp_filename)
+            upload_filepath = os.path.join(UPLOAD_FOLDER, filename)
+
+            # Save permanently to uploads/
+            logger.debug(f"Saving {filename} to {upload_filepath}")
+            pdf_file.save(upload_filepath)
+            # Save temporarily for processing
+            pdf_file.seek(0)
             pdf_file.save(temp_filepath)
 
             loader = PDFPlumberLoader(temp_filepath)
             docs = loader.load()
             for doc in docs:
-                doc.metadata["source"] = pdf_file.filename
+                doc.metadata["source"] = filename
             all_docs.extend(docs)
             os.remove(temp_filepath)
+            logger.debug(f"Processed {filename} with {len(docs)} pages")
         except Exception as e:
-            return False, f"Error loading '{pdf_file.filename}': {e}"
+            logger.error(f"Error processing '{pdf_file.filename}': {e}")
+            return False, f"Error processing '{pdf_file.filename}': {e}"
 
     if not all_docs:
+        logger.warning("No documents loaded successfully.")
         return False, "No documents could be loaded successfully."
 
     try:
         text_splitter = SemanticChunker(embeddings)
         documents = text_splitter.split_documents(all_docs)
+        logger.debug(f"Split into {len(documents)} chunks")
     except Exception as e:
+        logger.error(f"Error splitting documents: {e}")
         return False, f"Error splitting documents: {e}"
 
     try:
-        if clear_collection:
-            temp_vs = PGVector(
-                embeddings=embeddings,
-                collection_name=COLLECTION_NAME,
-                connection=CONNECTION_STRING,
-            )
-            temp_vs.delete_collection()
-
         state.vectorstore = PGVector.from_documents(
             embedding=embeddings,
             documents=documents,
             collection_name=COLLECTION_NAME,
             connection=CONNECTION_STRING,
+            pre_delete_collection=False  # Avoid accidental clearing
         )
-        state.processed_files = [f.filename for f in pdf_files]
+        if clear_collection:
+            state.processed_files = [secure_filename(f.filename) for f in pdf_files]
+        else:
+            state.processed_files = list(set(state.processed_files + [secure_filename(f.filename) for f in pdf_files]))
         state.qa_chain = None  # Reset QA chain
+        logger.debug(f"Vector store updated with {len(documents)} chunks")
         return True, f"Vector store updated with {len(documents)} chunks."
     except psycopg2.OperationalError as e:
+        logger.error(f"Database error during vector store creation: {e}")
         return False, f"Database error during vector store creation: {e}"
     except Exception as e:
+        logger.error(f"Error interacting with PGVector: {e}")
         return False, f"Error interacting with PGVector: {e}"
 
 def setup_qa_chain():
     if not state.vectorstore:
+        logger.error("Vector store not initialized.")
         return False, "Vector store not initialized."
 
     try:
         retriever = state.vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 5}
+            search_kwargs={"k": 10}
         )
         if not GOOGLE_API_KEY or "YOUR_GOOGLE_API_KEY" in GOOGLE_API_KEY:
+            logger.error("Invalid Google API Key.")
             return False, "Invalid Google API Key."
 
         llm = ChatGoogleGenerativeAI(
@@ -177,9 +224,11 @@ def setup_qa_chain():
             return_source_documents=True,
             chain_type_kwargs={"prompt": QA_PROMPT}
         )
+        logger.debug("QA chain initialized.")
         return True, "QA chain initialized."
     except Exception as e:
         state.qa_chain = None
+        logger.error(f"Error setting up QA chain: {e}")
         return False, f"Error setting up QA chain: {e}"
 
 @app.route('/', methods=['GET', 'POST'])
@@ -198,15 +247,17 @@ def index():
             vectorstore_status = f"Error: {vs_message}"
 
     if request.method == 'POST':
-        clear_collection = 'clear_collection' in request.form
+        logger.debug(f"POST request received: form={dict(request.form)}, files={[f.filename for f in request.files.getlist('pdfs')]}")
+        clear_collection = request.form.get('clear_collection') == 'on'
         pdf_files = request.files.getlist('pdfs') if 'pdfs' in request.files else []
 
         if pdf_files:
-            valid_files = [f for f in pdf_files if allowed_file(f.filename)]
+            valid_files = [f for f in pdf_files if allowed_file(f.filename) and f.filename]
             if not valid_files:
                 message = "No valid PDF files uploaded."
                 message_type = "error"
             else:
+                logger.debug(f"Processing {len(valid_files)} valid files, clear_collection={clear_collection}")
                 success, proc_message = process_pdfs(valid_files, clear_collection)
                 if success:
                     message = proc_message
@@ -217,16 +268,34 @@ def index():
                     message = proc_message
                     message_type = "error"
         else:
+            logger.debug("No files uploaded in POST request.")
             message = "No files uploaded."
             message_type = "error"
+
+        # Redirect to avoid form resubmission
+        return redirect(url_for('index', message=message, message_type=message_type))
+
+    # Handle GET request
+    message = request.args.get('message')
+    message_type = request.args.get('message_type')
+    logger.debug(f"GET request: uploads contains {[f for f in os.listdir(UPLOAD_FOLDER)]}")
 
     return render_template('index.html',
                            db_status=db_ready,
                            db_message=db_message,
                            vectorstore_status=vectorstore_status,
                            processed_files=processed_files,
+                           base_url=BASE_URL,
                            message=message,
                            message_type=message_type)
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    try:
+        return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
+    except FileNotFoundError:
+        logger.error(f"Download failed: File '{filename}' not found in {UPLOAD_FOLDER}")
+        return jsonify({"error": f"File '{filename}' not found."}), 404
 
 @app.route('/api/status', methods=['GET'])
 def status():
@@ -252,40 +321,49 @@ def status():
 def ask_question():
     db_ready, db_message = check_db_connection(CONNECTION_STRING)
     if not db_ready:
+        logger.error(f"Database error: {db_message}")
         return jsonify({"error": db_message}), 500
 
     data = request.form
     question = data.get('question')
 
     if not question:
+        logger.error("No question provided.")
         return jsonify({"error": "Question is required."}), 400
 
     success, vs_message = init_vectorstore()
     if not success:
+        logger.error(f"Vector store error: {vs_message}")
         return jsonify({"error": vs_message}), 500
 
     if not state.qa_chain:
         success, qa_message = setup_qa_chain()
         if not success:
+            logger.error(f"QA chain error: {qa_message}")
             return jsonify({"error": qa_message}), 500
 
     try:
         result = state.qa_chain.invoke({"query": question})
         response = result['result']
         source_docs = result['source_documents']
+        logger.debug(f"Retrieved {len(source_docs)} source documents: {[doc.metadata.get('source', 'No source') for doc in source_docs]}")
         sources = [
             {
                 "source": doc.metadata.get('source', 'Unknown PDF'),
-                "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content
+                "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                "download_url": f"{BASE_URL}/download/{doc.metadata.get('source', '')}"
             }
             for doc in source_docs
         ]
+        if not sources:
+            logger.warning("No source documents retrieved for query.")
         return jsonify({
             "question": question,
             "answer": response,
             "sources": sources
         }), 200
     except Exception as e:
+        logger.error(f"Error processing question: {e}")
         return jsonify({"error": f"Error processing question: {e}"}), 500
 
 if __name__ == '__main__':
